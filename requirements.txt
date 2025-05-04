@@ -1,0 +1,7 @@
+torch
+transformers
+numpy
+scikit-learn
+pdf2image
+pytesseract
+Pillow
