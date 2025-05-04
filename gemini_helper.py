@@ -60,13 +60,37 @@ Instructions:
 Your answer:"""
 
             # Generate response
-            response = await self.model.generate_content_async(prompt)
-            
-            if not response or not response.text:
-                return "Sorry, I couldn't generate a response. Please try rephrasing your question."
+            try:
+                response = self.model.generate_content(prompt)
+                if response and hasattr(response, 'text'):
+                    return response.text.strip()
+                else:
+                    return "Sorry, I couldn't generate a valid response. Please try rephrasing your question."
+            except Exception as api_error:
+                if "text too long" in str(api_error).lower():
+                    # Try with shortened context if text is too long
+                    shortened_chunks = [chunk[:1000] for chunk in context_chunks]
+                    shortened_context = "\n\n".join(
+                        f"Context {i+1}:\n{chunk}" 
+                        for i, chunk in enumerate(shortened_chunks)
+                    )
+                    shortened_prompt = f"""Based on the following context from a document, please answer this question: "{question}"
+
+{shortened_context}
+
+Instructions:
+1. Provide a clear and concise answer based ONLY on the information provided
+2. If the question asks to EXPLAIN then provide a detailed explanation
+3. If you need more context, please indicate this in your response
+4. Use bullet points or numbered lists when appropriate
+
+Your answer:"""
+                    response = self.model.generate_content(shortened_prompt)
+                    if response and hasattr(response, 'text'):
+                        return response.text.strip() + "\n\nNote: Response was generated with truncated context due to length limitations."
+                    
+                raise  # Re-raise if shortening didn't help
                 
-            return response.text.strip()
-            
         except Exception as e:
             error_msg = str(e)
             if "quota exceeded" in error_msg.lower():
