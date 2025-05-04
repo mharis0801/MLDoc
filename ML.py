@@ -34,11 +34,37 @@ def get_cache_path(pdf_path):
     return os.path.join(CACHE_DIR, f"{pdf_hash}.pickle")
 
 def process_image(image):
-    """Process a single image with OCR"""
+    """Process a single image with OCR using optimized settings"""
     try:
-        # Set up tesseract parameters for better speed/accuracy trade-off
-        custom_config = r'--oem 1 --psm 6'
-        return pytesseract.image_to_string(image, config=custom_config)
+        # Convert image to high contrast black and white
+        image = image.convert('L')
+        
+        # Enhance image contrast
+        from PIL import ImageEnhance
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(2.0)
+        
+        # Set up tesseract parameters with improved quotation handling
+        custom_config = r"""--oem 1 --psm 6 
+            -c tessedit_char_blacklist=©
+            -c tessedit_char_whitelist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,!?@#$%^&*()_+-=<>[]{}|/\\:;'\"` \n"
+            -c preserve_interword_spaces=1
+            -c textord_old_xheight=0
+            -c textord_fix_xheight_bug=1"""
+        
+        # Extract text with improved settings
+        text = pytesseract.image_to_string(
+            image,
+            config=custom_config,
+            lang='eng'  # Specify English language
+        )
+        
+        # Clean up extracted text with improved handling of quotes
+        text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
+        text = re.sub(r'[^\x20-\x7E\n]', '', text)  # Keep only printable ASCII and newlines
+        text = re.sub(r'(?<=[.!?])\s', '\n', text)  # Add line breaks after sentences
+        
+        return text.strip()
     except Exception as e:
         print(f"Warning: Could not process image: {str(e)}")
         return ""
@@ -58,52 +84,65 @@ def extract_text_from_pdf(pdf_path, progress_callback=None):
                 print("Using cached PDF text")
                 return cached_data['text']
         except:
+            print("Cache invalid, reprocessing PDF")
             pass
 
     # Create a temporary directory to store images
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Convert PDF to images with optimized parameters
-        images = convert_from_path(
-            pdf_path,
-            thread_count=os.cpu_count(),
-            use_pdftocairo=True,
-            grayscale=True
-        )
-        
-        total_pages = len(images)
-        print(f"Total pages found: {total_pages}")
-        
-        # Process images in parallel
-        with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            future_to_page = {
-                executor.submit(process_image, image): i 
-                for i, image in enumerate(images)
-            }
-            
-            text_chunks = [""] * total_pages
-            
-            for future in concurrent.futures.as_completed(future_to_page):
-                page_num = future_to_page[future]
-                try:
-                    text_chunks[page_num] = future.result()
-                    if progress_callback:
-                        progress_callback(page_num + 1, total_pages)
-                except Exception as e:
-                    print(f"Warning: Could not process page {page_num + 1}: {str(e)}")
-                    
-        text = "\n\n".join(chunk for chunk in text_chunks if chunk.strip())
-                
-        if not text.strip():
-            raise ValueError("No text could be extracted from the PDF")
-            
-        # Cache the results
         try:
-            with open(cache_path, 'wb') as f:
-                pickle.dump({'text': text}, f)
-        except:
-            print("Warning: Could not cache PDF text")
+            # Convert PDF to images with optimized parameters
+            images = convert_from_path(
+                pdf_path,
+                dpi=300,  # Increased DPI for better quality
+                thread_count=os.cpu_count(),
+                use_pdftocairo=True,
+                grayscale=True,
+                size=(2000, None),  # Set max width while maintaining aspect ratio
+                paths_only=False  # Ensure we get PIL Image objects
+            )
             
-        return text
+            if not images:
+                raise ValueError("No pages could be extracted from the PDF")
+            
+            total_pages = len(images)
+            print(f"Total pages found: {total_pages}")
+            
+            # Process images in parallel with improved OCR settings
+            with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+                future_to_page = {
+                    executor.submit(process_image, image): i 
+                    for i, image in enumerate(images)
+                }
+                
+                text_chunks = [""] * total_pages
+                
+                for future in concurrent.futures.as_completed(future_to_page):
+                    page_num = future_to_page[future]
+                    try:
+                        text_chunks[page_num] = future.result()
+                        if progress_callback:
+                            progress_callback(page_num + 1, total_pages)
+                    except Exception as e:
+                        print(f"Warning: Could not process page {page_num + 1}: {str(e)}")
+                        text_chunks[page_num] = ""  # Ensure empty string for failed pages
+                
+            # Filter and join text chunks
+            text = "\n\n".join(chunk for chunk in text_chunks if chunk.strip())
+            
+            if not text.strip():
+                raise ValueError("No text could be extracted from the PDF")
+            
+            # Cache the results
+            try:
+                with open(cache_path, 'wb') as f:
+                    pickle.dump({'text': text}, f)
+            except Exception as e:
+                print(f"Warning: Could not cache PDF text: {str(e)}")
+            
+            return text
+            
+        except Exception as e:
+            raise Exception(f"Error processing PDF: {str(e)}")
 
 @functools.lru_cache(maxsize=1000)
 def get_embedding_cached(text):
