@@ -1,16 +1,30 @@
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
 from ML import extract_text_from_pdf, preprocess_text, find_relevant_info, validate_pdf_path
+from gemini_helper import GeminiHelper
 import threading
 import os
 import queue
 import time
+import asyncio
+import json
+from concurrent.futures import ThreadPoolExecutor
 
 class PDFQuestionAnswerUI:
     def __init__(self, root):
         self.root = root
         self.root.title("PDF Question Answering System")
         self.root.geometry("800x600")
+        
+        # Initialize Gemini AI
+        self.gemini = GeminiHelper()
+        self.use_ai = tk.BooleanVar(value=False)
+        
+        # Create async loop in a separate thread
+        self.loop_thread = threading.Thread(target=self._run_event_loop, daemon=True)
+        self.loop_thread.start()
+        self.loop = None
+        self.loop_ready = threading.Event()
         
         # Variables
         self.pdf_path = None
@@ -27,6 +41,9 @@ class PDFQuestionAnswerUI:
         self.max_workers = os.cpu_count()
         self.processing_thread = None
         
+        # Wait for event loop to be ready
+        self.loop_ready.wait()
+        
         # Style configuration
         self.configure_styles()
         
@@ -36,13 +53,37 @@ class PDFQuestionAnswerUI:
         
         # Create UI components
         self.create_pdf_selection()
+        self.create_ai_toggle()
         self.create_question_input()
         self.create_answer_display()
         self.create_status_bar()
         
+        # Load API key if exists
+        self.load_api_key()
+        
         # Bind events
         self.question_entry.bind('<Return>', lambda e: self.ask_question())
-        
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+    
+    def _run_event_loop(self):
+        """Run async event loop in separate thread"""
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.loop_ready.set()
+        self.loop.run_forever()
+    
+    def run_coroutine(self, coro):
+        """Run a coroutine in the event loop and return a future"""
+        if not self.loop:
+            raise RuntimeError("Event loop not initialized")
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+    
+    def on_closing(self):
+        """Clean up resources when closing the application"""
+        if self.loop:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        self.root.destroy()
+    
     def configure_styles(self):
         style = ttk.Style()
         style.configure('Modern.TButton', padding=10)
@@ -65,6 +106,98 @@ class PDFQuestionAnswerUI:
             style='Modern.TButton'
         )
         self.select_button.pack(side=tk.RIGHT)
+    
+    def create_ai_toggle(self):
+        """Create Gemini AI toggle switch and API key entry"""
+        ai_frame = ttk.Frame(self.main_frame)
+        ai_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # AI Toggle switch
+        self.ai_toggle = ttk.Checkbutton(
+            ai_frame,
+            text="Use Gemini AI",
+            variable=self.use_ai,
+            command=self.toggle_ai
+        )
+        self.ai_toggle.pack(side=tk.LEFT)
+        
+        # API Key entry
+        self.api_key_var = tk.StringVar()
+        ttk.Label(ai_frame, text="API Key:").pack(side=tk.LEFT, padx=(20, 5))
+        self.api_key_entry = ttk.Entry(ai_frame, textvariable=self.api_key_var, show="*")
+        self.api_key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        # Save API Key button
+        self.save_key_button = ttk.Button(
+            ai_frame,
+            text="Save Key",
+            command=self.save_api_key,
+            style='Modern.TButton'
+        )
+        self.save_key_button.pack(side=tk.RIGHT, padx=(5, 0))
+    
+    def toggle_ai(self):
+        """Handle AI toggle switch changes"""
+        if self.use_ai.get() and not self.gemini.is_initialized():
+            api_key = self.api_key_var.get().strip()
+            if not api_key:
+                messagebox.showwarning(
+                    "API Key Required",
+                    "Please enter your Gemini API key to use AI features."
+                )
+                self.use_ai.set(False)
+                return
+            
+            def init_gemini():
+                if not self.gemini.initialize(api_key):
+                    self.root.after(0, lambda: messagebox.showerror(
+                        "Initialization Error",
+                        "Failed to initialize Gemini AI. Please check your API key."
+                    ))
+                    self.root.after(0, lambda: self.use_ai.set(False))
+            
+            # Initialize Gemini in a separate thread
+            threading.Thread(target=init_gemini, daemon=True).start()
+    
+    def save_api_key(self):
+        """Save API key to configuration file"""
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            messagebox.showwarning(
+                "Invalid Key",
+                "Please enter a valid API key."
+            )
+            return
+        
+        try:
+            config = {'api_key': api_key}
+            with open('config.json', 'w') as f:
+                json.dump(config, f)
+            messagebox.showinfo(
+                "Success",
+                "API key saved successfully!"
+            )
+            # Initialize Gemini if toggle is on
+            if self.use_ai.get():
+                self.gemini.initialize(api_key)
+        except Exception as e:
+            messagebox.showerror(
+                "Error",
+                f"Failed to save API key: {str(e)}"
+            )
+    
+    def load_api_key(self):
+        """Load API key from configuration file"""
+        try:
+            if os.path.exists('config.json'):
+                with open('config.json', 'r') as f:
+                    config = json.load(f)
+                    api_key = config.get('api_key')
+                    if api_key:
+                        self.api_key_var.set(api_key)
+                        # Don't initialize yet, wait for toggle
+        except Exception as e:
+            print(f"Error loading API key: {str(e)}")
         
     def create_question_input(self):
         question_frame = ttk.Frame(self.main_frame)
@@ -213,6 +346,15 @@ class PDFQuestionAnswerUI:
         self.processing_thread = threading.Thread(target=process, daemon=True)
         self.processing_thread.start()
         
+    async def get_ai_response(self, query, relevant_chunks):
+        """Get response from Gemini AI"""
+        if not self.gemini.is_initialized():
+            return "Gemini AI is not initialized. Please provide an API key and enable AI."
+        
+        # Extract text from relevant chunks
+        context_texts = [chunk for chunk, _ in relevant_chunks]
+        return await self.gemini.get_response(query, context_texts)
+    
     def ask_question(self):
         if not self.pdf_path or not self.chunks:
             messagebox.showwarning(
@@ -224,7 +366,7 @@ class PDFQuestionAnswerUI:
         if self.processing:
             messagebox.showwarning(
                 "Warning",
-                "Please wait while the current PDF is being processed!"
+                "Please wait while the current process completes!"
             )
             return
             
@@ -261,10 +403,30 @@ class PDFQuestionAnswerUI:
                     # Cache the results
                     self.last_question = query
                     self.last_result = relevant_info
+                    
+                    # Display relevant chunks
                     self.display_results(relevant_info)
+                    
+                    # If AI is enabled, get AI response
+                    if self.use_ai.get():
+                        self.status_var.set("Getting AI response...")
+                        
+                        def handle_ai_response(future):
+                            try:
+                                ai_response = future.result()
+                                self.root.after(0, lambda: self.update_ai_response(ai_response))
+                            except Exception as e:
+                                error_msg = f"\nError getting AI response: {str(e)}\n"
+                                self.root.after(0, lambda: self.update_ai_response(error_msg))
+                        
+                        # Run AI response in background
+                        future = self.run_coroutine(self.get_ai_response(query, relevant_info))
+                        future.add_done_callback(handle_ai_response)
                 
                 search_time = time.time() - start_time
-                self.status_var.set(f"Found {len(relevant_info)} results in {search_time:.2f}s")
+                self.status_var.set(
+                    f"Found {len(relevant_info)} results in {search_time:.2f}s"
+                )
                 
             except Exception as e:
                 self.answer_text.delete(1.0, tk.END)
@@ -281,6 +443,12 @@ class PDFQuestionAnswerUI:
         
         thread = threading.Thread(target=process_question, daemon=True)
         thread.start()
+    
+    def update_ai_response(self, response):
+        """Update UI with AI response"""
+        self.answer_text.insert(tk.END, "\nAI Analysis:\n")
+        self.answer_text.insert(tk.END, "─" * 80 + "\n")
+        self.answer_text.insert(tk.END, f"{response}\n")
     
     def display_results(self, results):
         """Display search results with formatting"""
